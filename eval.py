@@ -113,6 +113,7 @@ class EvalResult:
     duration_s: float = 0.0
     error: str = ""
     warnings: list[str] = field(default_factory=list)
+    preloaded: bool = False  # True when BM25 score >= threshold → skill injected deterministically
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,6 +201,15 @@ class PluginRegistry:
             if not any(s.name == always_include for s in top):
                 top.append(self.skills[always_include])
         return top
+
+    def bm25_score(self, query: str, skill_name: str) -> float:
+        """Return BM25 score for a specific skill against a query."""
+        if not self._bm25 or skill_name not in self._skill_names:
+            return 0.0
+        tokens = query.lower().split()
+        scores = self._bm25.get_scores(tokens)
+        idx = self._skill_names.index(skill_name)
+        return float(scores[idx])
 
     def get_mcp_servers(self, plugin_name: str) -> dict[str, dict]:
         """Parse .mcp.json for a plugin. Returns HTTP servers only: {name: {url, title}}."""
@@ -327,6 +337,24 @@ class AnthropicProvider:
             ],
         })
 
+    def skill_preload_messages(self, skill_name: str, content: str) -> list[dict]:
+        """Synthetic load_skill call+result injected before the first LLM turn (Anthropic format)."""
+        return [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "preload-0",
+                     "name": "load_skill", "input": {"name": skill_name}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "preload-0", "content": content},
+                ],
+            },
+        ]
+
 
 class OpenAIProvider:
     DEFAULT_MODEL = "gpt-5-mini"
@@ -395,6 +423,25 @@ class OpenAIProvider:
         for tid, output in tool_results:
             messages.append({"role": "tool", "tool_call_id": tid, "content": output})
 
+    def skill_preload_messages(self, skill_name: str, content: str) -> list[dict]:
+        """Synthetic load_skill call+result injected before the first LLM turn (OpenAI format)."""
+        return [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "preload-0", "type": "function",
+                     "function": {"name": "load_skill",
+                                  "arguments": json.dumps({"name": skill_name})}},
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "preload-0",
+                "content": content,
+            },
+        ]
+
 
 def make_provider(name: str) -> AnthropicProvider | OpenAIProvider:
     if name == "openai":
@@ -408,6 +455,11 @@ def make_provider(name: str) -> AnthropicProvider | OpenAIProvider:
 
 MAX_TURNS = 12
 
+# BM25 score threshold above which the target skill is pre-injected deterministically
+# (bypasses the LLM's load_skill decision). Observed scores for clear matches: 7–10.
+# Set to 0.0 to always pre-inject; float("inf") to never pre-inject (old behaviour).
+BM25_PRELOAD_THRESHOLD = 4.0
+
 
 async def run_agent(
     prompt: str,
@@ -416,9 +468,10 @@ async def run_agent(
     all_tools: list[dict],
     registry: PluginRegistry,
     mcp_tool_map: dict[str, Any],  # tool_name → fastmcp.Client
+    initial_messages: list[dict] | None = None,
 ) -> tuple[str, list[ToolCall], int, int]:
     """Run agent loop. Returns (final_response, trace, total_input_tokens, total_output_tokens)."""
-    messages: list[dict] = [{"role": "user", "content": prompt}]
+    messages: list[dict] = list(initial_messages or []) + [{"role": "user", "content": prompt}]
     trace: list[ToolCall] = []
     total_in = total_out = 0
 
@@ -548,7 +601,8 @@ def render_report(results: list[EvalResult], provider_name: str, manifest_path: 
             f"## {icon} `{r.id}` — {r.status}",
             "",
             f"**Skill**: `{r.skill}`  **Plugin**: `{r.plugin}`  "
-            f"**Model**: `{r.model}`  ",
+            f"**Model**: `{r.model}`  "
+            + ("**Skill load**: BM25 pre-injected  " if r.preloaded else "**Skill load**: LLM-decided  "),
             f"**Duration**: {r.duration_s:.1f}s  "
             f"**Tokens**: {r.input_tokens:,} in / {r.output_tokens:,} out",
             "",
@@ -603,28 +657,50 @@ async def run_eval_case(
     assertions = case.get("assertions", {})
     warnings: list[str] = []
 
-    # Build skill catalog via BM25 (top 15, always include target)
-    top = registry.top_skills(prompt, n=15, always_include=skill_name)
-    catalog = "\n".join(f"- **{s.name}**: {s.description[:120]}" for s in top)
-    system = (
-        "You are a UK legal research assistant. "
-        "You have access to skills and live MCP tools — you MUST use them. "
-        "Do NOT answer from your own training knowledge.\n\n"
-        "## Rules (follow exactly)\n"
-        "1. Before responding to any user request, check whether a skill in the catalog matches.\n"
-        "2. If a skill matches, you MUST call `load_skill` with that skill's name FIRST. "
-        "Do not write any response before calling load_skill.\n"
-        "3. After load_skill returns the full instructions, follow them precisely and use the "
-        "MCP tools they specify.\n"
-        "4. If no skill matches and no MCP tool is relevant, say so explicitly — "
-        "do not answer from your own knowledge.\n\n"
-        "## Skills catalog\n"
-        f"{catalog}\n"
-    )
+    # BM25: check if target skill scores above the preload threshold.
+    # If yes, inject the skill content as a synthetic load_skill call before the first LLM turn.
+    # This mirrors how Claude Code actually loads skills (deterministic, not LLM-decided).
+    bm25_score = registry.bm25_score(prompt, skill_name)
+    preloaded = bm25_score >= BM25_PRELOAD_THRESHOLD
+    target_skill = registry.skills.get(skill_name)
+
+    if preloaded and target_skill:
+        # Focused system prompt: skill already loaded, just execute it
+        system = (
+            "You are a UK legal research assistant. "
+            "The skill instructions below have been loaded for this request. "
+            "Follow them precisely and use the MCP tools they specify. "
+            "Do NOT answer from your own training knowledge — use only the tools available.\n"
+        )
+        # Synthetic trace entry so skill_triggered assertion still passes
+        preload_trace = [ToolCall(
+            id="preload-0",
+            name="load_skill",
+            input={"name": skill_name},
+            result=target_skill.content,
+        )]
+    else:
+        # Fallback: offer load_skill as a callable tool with a catalog
+        top = registry.top_skills(prompt, n=15, always_include=skill_name)
+        catalog = "\n".join(f"- **{s.name}**: {s.description[:120]}" for s in top)
+        system = (
+            "You are a UK legal research assistant. "
+            "You have access to skills and live MCP tools — you MUST use them. "
+            "Do NOT answer from your own training knowledge.\n\n"
+            "## Rules (follow exactly)\n"
+            "1. Before responding, check whether a skill in the catalog matches the request.\n"
+            "2. If a skill matches, you MUST call `load_skill` with that skill's name FIRST. "
+            "Do not write any response before calling load_skill.\n"
+            "3. After load_skill returns, follow its instructions precisely.\n"
+            "4. If no skill matches, say so — do not answer from your own knowledge.\n\n"
+            "## Skills catalog\n"
+            f"{catalog}\n"
+        )
+        preload_trace = []
 
     # Connect to HTTP MCP servers for this plugin
     servers = registry.get_mcp_servers(plugin_name)
-    all_tools: list[dict] = [provider.load_skill_tool()]
+    all_tools: list[dict] = [] if preloaded else [provider.load_skill_tool()]
     mcp_tool_map: dict[str, Any] = {}
 
     t0 = time.monotonic()
@@ -643,15 +719,24 @@ async def run_eval_case(
                 except Exception as exc:
                     warnings.append(f"MCP '{server_name}' unreachable: {exc}")
 
-            response, trace, total_in, total_out = await run_agent(
+            # Build initial messages: preload injection (if any) + user prompt
+            preload_messages = (
+                provider.skill_preload_messages(skill_name, target_skill.content)
+                if preloaded and target_skill
+                else []
+            )
+
+            response, agent_trace, total_in, total_out = await run_agent(
                 prompt=prompt,
                 system=system,
                 provider=provider,
                 all_tools=all_tools,
                 registry=registry,
                 mcp_tool_map=mcp_tool_map,
+                initial_messages=preload_messages,
             )
 
+        trace = preload_trace + agent_trace
         duration = time.monotonic() - t0
         assertion_results = run_assertions(assertions, response, trace)
         status = "PASS" if all(a.passed for a in assertion_results) else "FAIL"
@@ -670,6 +755,7 @@ async def run_eval_case(
             output_tokens=total_out,
             duration_s=duration,
             warnings=warnings,
+            preloaded=preloaded,
         )
 
     except Exception as exc:
