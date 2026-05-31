@@ -329,7 +329,7 @@ class AnthropicProvider:
 
 
 class OpenAIProvider:
-    DEFAULT_MODEL = "gpt-4o"
+    DEFAULT_MODEL = "gpt-5-mini"
 
     def __init__(self) -> None:
         import openai
@@ -607,10 +607,19 @@ async def run_eval_case(
     top = registry.top_skills(prompt, n=15, always_include=skill_name)
     catalog = "\n".join(f"- **{s.name}**: {s.description[:120]}" for s in top)
     system = (
-        "You are a legal research assistant with access to UK legal tools.\n\n"
-        f"Skills available (call load_skill to get full instructions):\n{catalog}\n\n"
-        "When a skill matches the user's request, call load_skill first to load its "
-        "instructions, then follow them precisely."
+        "You are a UK legal research assistant. "
+        "You have access to skills and live MCP tools — you MUST use them. "
+        "Do NOT answer from your own training knowledge.\n\n"
+        "## Rules (follow exactly)\n"
+        "1. Before responding to any user request, check whether a skill in the catalog matches.\n"
+        "2. If a skill matches, you MUST call `load_skill` with that skill's name FIRST. "
+        "Do not write any response before calling load_skill.\n"
+        "3. After load_skill returns the full instructions, follow them precisely and use the "
+        "MCP tools they specify.\n"
+        "4. If no skill matches and no MCP tool is relevant, say so explicitly — "
+        "do not answer from your own knowledge.\n\n"
+        "## Skills catalog\n"
+        f"{catalog}\n"
     )
 
     # Connect to HTTP MCP servers for this plugin
