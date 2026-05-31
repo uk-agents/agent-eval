@@ -1,0 +1,34 @@
+{
+  "description": "Minimal showcase — verifies that a prompt triggers the right skill via load_skill. No MCP assertions, so these pass without live servers.",
+  "evals": [
+    {
+      "id": "worker-classification-trigger",
+      "skill": "worker-classification",
+      "plugin": "employment-legal-uk",
+      "prompt": "Is a Deliveroo courier an employee or independent contractor under UK law? They set their own hours and use their own bike.",
+      "assertions": {
+        "skill_triggered": "worker-classification",
+        "must_not_contain": ["I cannot provide legal advice", "I am unable to assist"]
+      }
+    },
+    {
+      "id": "termination-review-trigger",
+      "skill": "termination-review",
+      "plugin": "employment-legal-uk",
+      "prompt": "We need to dismiss a senior developer who returned from sick leave last month. They've had two written warnings. Is this safe to proceed?",
+      "assertions": {
+        "skill_triggered": "termination-review",
+        "must_not_contain": ["I cannot provide legal advice"]
+      }
+    },
+    {
+      "id": "dsar-response-trigger",
+      "skill": "dsar-response",
+      "plugin": "privacy-legal-uk",
+      "prompt": "A customer has emailed asking for all the data we hold on them. What do we need to do and by when?",
+      "assertions": {
+        "skill_triggered": "dsar-response"
+      }
+    }
+  ]
+}
