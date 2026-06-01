@@ -6,6 +6,7 @@
 #   "openai>=1.50",
 #   "fastmcp>=2.0",
 #   "rank-bm25>=0.2",
+#   "pyyaml>=6.0",
 # ]
 # ///
 """
@@ -121,18 +122,35 @@ class EvalResult:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Parse YAML-style frontmatter delimited by ---. Returns (meta, body)."""
+    """Parse YAML frontmatter delimited by ---. Returns (meta, body).
+
+    Uses PyYAML so that multi-line block scalars (description: >) are
+    parsed correctly into a single string rather than capturing just '>'.
+    """
     if not text.startswith("---"):
         return {}, text
     parts = text.split("---", 2)
     if len(parts) < 3:
         return {}, text
-    meta: dict = {}
-    for line in parts[1].strip().splitlines():
-        if ":" in line:
-            k, _, v = line.partition(":")
-            meta[k.strip()] = v.strip().strip('"').strip("'")
-    return meta, parts[2].strip()
+    try:
+        import yaml
+        raw_meta = yaml.safe_load(parts[1]) or {}
+        meta: dict = {}
+        for k, v in raw_meta.items():
+            if isinstance(v, str):
+                # Collapse block scalars / newlines to a single line
+                meta[str(k)] = " ".join(v.split())
+            elif v is not None:
+                meta[str(k)] = str(v)
+        return meta, parts[2].strip()
+    except Exception:
+        # Fallback: simple key:value parser (doesn't handle block scalars)
+        meta = {}
+        for line in parts[1].strip().splitlines():
+            if ":" in line and not line.startswith(" "):
+                k, _, v = line.partition(":")
+                meta[k.strip()] = v.strip().strip('"').strip("'")
+        return meta, parts[2].strip()
 
 
 class PluginRegistry:
